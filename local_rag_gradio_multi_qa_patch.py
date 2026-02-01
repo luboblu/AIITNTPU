@@ -10,6 +10,12 @@ from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 from docx import Document
 from dotenv import load_dotenv
+from omnilingual_asr.models.inference.pipeline import ASRInferencePipeline
+# ==== 修改：改用 Llama-cpp-python (GGUF) ====
+try:
+    from llama_cpp import Llama
+except ImportError:
+    raise ImportError("請先安裝套件: pip install llama-cpp-python")
 
 # ==== 影像處理與HTTP ====
 from io import BytesIO
@@ -21,7 +27,7 @@ import mimetypes
 import tempfile
 
 # ==== 文字檢索強化 ====
-from rank_bm25 import BM25Okapi  # pip install rank_bm25
+from rank_bm25 import BM25Okapi
 
 # =========================
 # 基本設定
@@ -30,7 +36,6 @@ load_dotenv()
 DATA_ROOT = Path("./data")
 MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 FIXED_TOP_K = 4
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 MARGIN = 0.05
 MIN_SIM = 0.20
 MEMORY_TURNS = 5
@@ -43,8 +48,85 @@ NIM_MODEL_MAIN = os.getenv("NV_NIM_MODEL_MAIN", "google/gemma-3-27b-it")
 NIM_MODEL_FALL = os.getenv("NV_NIM_MODEL_FALL", "meta/llama-3.2-11b-vision-instruct")
 
 # Base64 限制
-MAX_B64_SIZE = 3_500_000  # ~3.5MB
+MAX_B64_SIZE = 3_500_000
 MIN_EDGE_LIMIT = 640
+
+# 2. 初始化 ASR Pipeline (放在全域變數區)
+print("正在載入 Omnilingual ASR 模型...")
+asr_pipeline = ASRInferencePipeline(model_card="omniASR_LLM_3B")  # 或選擇 300M/3B/7B
+print("ASR 模型載入完成!")
+
+# =========================
+# 【本地模型初始化 (GGUF)】
+# =========================
+MODEL_PATH = "./gpt-oss-20b-Q6_K.gguf"
+
+print(f"正在載入本地 GGUF 模型：{MODEL_PATH}...")
+
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"找不到模型檔案：{MODEL_PATH}，請確認檔案是否在資料夾內。")
+
+# 初始化 Llama
+llm = Llama(
+    model_path=MODEL_PATH,
+    n_gpu_layers=-1, 
+    n_ctx=32768,      
+    verbose=True
+)
+
+def local_chat_inference(messages, max_new_tokens=None, temperature=0.7):
+    """
+    統一處理本地模型的推論呼叫，並顯示詳細的 Token 使用量以利除錯
+    """
+    try:
+        # 如果沒有指定 max_tokens，預設給它超大空間 (不設限，直到 context 滿)
+        # 這裡設定 0 或 None 在某些版本代表無限
+        req_tokens = 0 
+        
+        print(">>> 開始推論 (Inference Started)...")
+        
+        response = llm.create_chat_completion(
+            messages=messages,
+            max_tokens=req_tokens, # 0 代表不限制生成長度，直到 n_ctx 滿為止
+            temperature=temperature,
+            stream=False
+        )
+        
+        # ==== Debug: 印出它到底吃了多少資源 ====
+        usage = response.get('usage', {})
+        print(f"--- 推論統計 ---")
+        print(f"輸入 Token 數 (Prompt): {usage.get('prompt_tokens', 0)}")
+        print(f"輸出 Token 數 (Output): {usage.get('completion_tokens', 0)}")
+        print(f"總計 Token 數 (Total):  {usage.get('total_tokens', 0)}")
+        print(f"停止原因 (Finish Reason): {response['choices'][0]['finish_reason']}")
+        print(f"----------------")
+
+        raw_content = response["choices"][0]["message"]["content"]
+
+        # ==== 強力過濾邏輯 ====
+        final_marker = "<|channel|>final<|message|>"
+        analysis_start = "<|channel|>analysis<|message|>"
+        
+        if final_marker in raw_content:
+            clean_content = raw_content.split(final_marker)[-1]
+        elif analysis_start in raw_content:
+            # 如果被截斷，嘗試救回已生成的思考後內容
+            clean_content = re.sub(r"<\|channel\|>analysis<\|message\|>.*?(<\|end\|>|$)", "", raw_content, flags=re.DOTALL)
+            if not clean_content.strip():
+                # 根據停止原因給出不同提示
+                reason = response['choices'][0]['finish_reason']
+                if reason == 'length':
+                    return f"（AI 思考過度導致長度耗盡。已生成 {usage.get('completion_tokens')} tokens。請嘗試簡化問題。）"
+                return "（AI 產生了無效的回應，請重試。）"
+        else:
+            clean_content = raw_content
+
+        clean_content = clean_content.replace("<|end|>", "").replace("<|start|>", "").strip()
+        return clean_content
+
+    except Exception as e:
+        print(f"推論錯誤: {e}")
+        return f"模型推論發生錯誤: {e}"
 
 # =========================
 # 組織資料
@@ -53,32 +135,57 @@ ORG_REGISTRY = {
     "msm": {
         "label": "勵友協會（就業輔導）",
         "path": DATA_ROOT / "msm",
-        "system_prompt": """你是基督教勵友中心的溫暖客服助理，
-請依據提供的資料回答問題，語氣親切、鼓勵且簡潔（120字內）。"""
+        "system_prompt": """你是勵友中心的專業 AI 助理。
+請扮演一位溫暖、有同理心且專業的客服人員。
+你的任務是依據資料回答問題，請遵守以下規則：
+1. **語氣自然**：像真人一樣對話，不要機械化。
+2. **重點清晰**：使用條列式或分段說明。
+3. **過濾思考**：直接給出最終答案。
+4. **不知則不知**：如果參考資料中沒有答案，請直接回答「不好意思，提供的資料中沒有相關資訊，建議您直接致電中心詢問」，不要嘗試編造。
+5. **精準數據**：電話、地址、金額等資訊，必須嚴格依照參考資料輸出，**絕對禁止使用 'XXX' 或掩碼**，如果資料裡有電話就完整寫出來。
+請嚴格根據提供的資料內容回答，若資料不足請委婉告知。"""
     },
     "tyad": {
         "label": "桃園輔具中心（輔具/補助）",
         "path": DATA_ROOT / "tyad",
-        "system_prompt": """你是桃園市北區輔具資源中心的客服助理，
-請根據資料內容回覆使用者問題，語氣溫和、清楚，條列說明（150字內）。"""
+        "system_prompt": """你是桃園市北區輔具資源中心的 AI 助理。
+請扮演一位親切、耐心且邏輯清晰的客服。
+你的任務是協助民眾了解輔具與補助，請遵守以下規則：
+1. **語氣柔和**：讓使用者感到被幫助。
+2. **結構分明**：複雜的流程請用步驟說明。
+3. **忠於原意**：翻譯或回答時，請保留原始地名（如桃園 Taoyuan），不要因為語言改變而捏造地點。
+4. **不知則不知**：如果參考資料中沒有答案，請直接回答「不好意思，提供的資料中沒有相關資訊，建議您直接致電中心詢問」，不要嘗試編造。
+5. **精準數據**：電話、地址、金額等資訊，必須嚴格依照參考資料輸出，**絕對禁止使用 'XXX' 或掩碼**，如果資料裡有電話就完整寫出來。
+請依據提供的資料回覆。"""
     }
 }
 
 # =========================
-# 語言（以下拉式選單為準）
+# 語言設定 (已修正代碼對應)
 # =========================
 LANG_LABELS = ["繁體中文", "English", "Vietnamese"]
 LANG_CODE = {
-    "繁體中文": "zh-Hant",
-    "English": "en",
-    "Vietnamese": "vi",
+    "繁體中文": "cmn",
+    "English": "eng",
+    "Vietnamese": "vie",
 }
+
+# 【修正】強化後的語言指令，使用強烈語氣
 def lang_instruction(code: str) -> str:
-    return {
-        "zh-Hant": "請全程使用繁體中文作答。",
-        "en": "Please answer entirely in English.",
-        "vi": "Vui lòng trả lời hoàn toàn bằng tiếng Việt.",
-    }[code]
+    instructions = {
+        # --- 繁體中文 ---
+        "cmn": "OUTPUT RULE: 請全程使用『繁體中文』回答。",
+        "zh-Hant": "OUTPUT RULE: 請全程使用『繁體中文』回答。",
+        
+        # --- 英文 ---
+        "eng": "OUTPUT RULE: You MUST answer in English. Do not use Chinese.",
+        "en": "OUTPUT RULE: You MUST answer in English. Do not use Chinese.",
+        
+        # --- 越南文 ---
+        "vie": "OUTPUT RULE: Bạn PHẢI trả lời bằng tiếng Việt. Không sử dụng tiếng Trung.",
+        "vi": "OUTPUT RULE: Bạn PHẢI trả lời bằng tiếng Việt. Không sử dụng tiếng Trung.",
+    }
+    return instructions.get(code, "OUTPUT RULE: 請全程使用『繁體中文』回答。")
 
 # =========================
 # 檔案載入
@@ -167,7 +274,7 @@ def scan_org_dir(org_path: Path):
 # 向量化 + 檢索資源
 # =========================
 def make_embedder(name: str):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     return SentenceTransformer(name, device=device)
 
@@ -180,16 +287,16 @@ def build_index(segments, embedder):
     return index, emb
 
 # =========================
-# OpenAI / Whisper
+# OpenAI (僅保留用於 Whisper)
 # =========================
 def get_openai_client():
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API")
     if not api_key:
-        raise RuntimeError("請設定 OPENAI_API_KEY 或 OPENAI_API 環境變數")
+        print("警告: 未偵測到 OPENAI_API_KEY，語音功能將失效。")
     return OpenAI(api_key=api_key)
 
 # =========================
-# 小聊偵測與回覆（遵守選單語言）
+# 小聊偵測
 # =========================
 def is_small_talk(client, text: str) -> bool:
     t = (text or "").strip()
@@ -197,14 +304,15 @@ def is_small_talk(client, text: str) -> bool:
         return False
     try:
         prompt = ("判斷下列訊息是否屬於一般聊天/寒暄/情緒支持/非知識型提問。"
-                  "若是，輸出『1』；否則輸出『0』。只輸出數字。")
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "system", "content": prompt},{"role": "user", "content": t}],
-            temperature=0, max_tokens=2
-        )
-        return (resp.choices[0].message.content or "").strip() == "1"
-    except Exception:
+                  "若是，輸出『1』；否則輸出『0』。只輸出數字，不要有其他文字。")
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": t}
+        ]
+        content = local_chat_inference(messages, max_new_tokens=5, temperature=0.1)
+        return "1" in (content or "").strip()
+    except Exception as e:
+        print(f"Small talk check error: {e}")
         return False
 
 def generate_small_talk(client, org_key: str, text: str, lang_code: str):
@@ -217,49 +325,63 @@ def generate_small_talk(client, org_key: str, text: str, lang_code: str):
         + f"\n\n{lang_instruction(lang_code)}"
     )
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "system", "content": sys_prompt},{"role": "user", "content": text.strip()}],
-            temperature=0.7, max_tokens=80,
-        )
-        return resp.choices[0].message.content.strip()
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": text.strip()}
+        ]
+        return local_chat_inference(messages, max_new_tokens=100, temperature=0.7)
     except Exception:
-        fallback = {
-            "zh-Hant": "謝謝你的分享，我在這裡陪你。",
-            "en": "Thanks for sharing—I'm here for you.",
-            "vi": "Cảm ơn bạn đã chia sẻ, mình luôn ở đây.",
-        }
-        return fallback[lang_code]
+        return "謝謝你的分享，我在這裡陪你。"
 
 # =========================
-# 記憶摘要與回答生成（遵守選單語言）
+# 記憶摘要
 # =========================
 def build_memory_summary(history):
     if not history: return ""
-    recent = history[-MEMORY_TURNS:]
-    parts = [f"【先前問題】{u}\n【先前回覆】{a}" for u, a in recent]
-    memo = "\n\n".join(parts)
+    limit = MEMORY_TURNS * 2
+    recent_history = history[-limit:] if len(history) > limit else history
+    
+    memo = ""
+    for i in range(0, len(recent_history), 2):
+        if i + 1 < len(recent_history):
+            user_msg = recent_history[i].get('content', '')
+            bot_msg = recent_history[i+1].get('content', '')
+            memo += f"【先前問題】{user_msg}\n【先前回覆】{bot_msg}\n\n"
+            
     return memo[-MEMORY_CHARS_LIMIT:] if len(memo) > MEMORY_CHARS_LIMIT else memo
 
-def generate_answer(client, system_prompt, query, retrieved, memory_summary="", lang_code="zh-Hant"):
-    ctx = " ".join(retrieved)[:4000]
+# 【修正】在 User Content 末尾強制注入語言指令 (Recency Bias)
+def generate_answer(client, system_prompt, query, retrieved, memory_summary="", lang_code="cmn"):
+    ctx = " ".join(retrieved)[:3500]
+    
+    # 取得強制的語言指令
+    instruction = lang_instruction(lang_code)
+    
     sys_prompt = (
         system_prompt
         + "\n\n你可以參考【短期記憶摘要】來維持上下文一致，但回覆必須以同組織的『參考段落』為主。"
         + "\n若參考內容不足以直接回答：允許給出『一般性背景說明或建議』，"
           "但請先用一句話溫和提示『以下為通用背景資訊，非出自本機構文件』，之後再給建議。"
-        + f"\n\n{lang_instruction(lang_code)}"
+        + f"\n\n**IMPORTANT: {instruction}**"
     )
-    user_content = f"【短期記憶摘要】\n{memory_summary}\n\n【目前問題】{query}\n\n【參考段落】\n{ctx}"
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
-        temperature=0.2, max_tokens=450,
+    
+    # === 關鍵修正：將語言指令放在最後面，讓模型不會忘記 ===
+    user_content = (
+        f"【短期記憶摘要】\n{memory_summary}\n\n"
+        f"【參考段落】\n{ctx}\n\n"
+        f"【目前問題】{query}\n\n"
+        f"再次提醒：{instruction}"
     )
-    return resp.choices[0].message.content.strip()
+    
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": user_content}
+    ]
+    # 稍微調低 temperature 防止亂飄
+    return local_chat_inference(messages, max_new_tokens=512, temperature=0.1)
 
 # =========================
-# 守門器（自適應）
+# 守門器 & 檢索
 # =========================
 def _adaptive_thresholds(q_text: str):
     L = len(q_text or "")
@@ -267,9 +389,6 @@ def _adaptive_thresholds(q_text: str):
     min_sim = MIN_SIM - (0.03 if L >= 30 else (0.01 if L >= 15 else 0.0))
     return max(margin, 0.02), max(min_sim, 0.12)
 
-# =========================
-# 鄰近文塊拼接
-# =========================
 def neighbor_answer_augmentation(hits, segments, tags, window_size=2, top_k=3):
     results, seen = [], set()
     for idx, tag, seg in hits:
@@ -283,9 +402,6 @@ def neighbor_answer_augmentation(hits, segments, tags, window_size=2, top_k=3):
         if len(results) >= top_k: break
     return results[:top_k]
 
-# =========================
-# 基本／混合檢索
-# =========================
 def search_semantic(pool, question, k, embedder, window_size=2, widen=2):
     segs, tags, index = pool["segments"], pool["tags"], pool["index"]
     q_vec = embedder.encode([question], convert_to_numpy=True)
@@ -299,26 +415,32 @@ def build_bm25_corpus(segments):
     tokenized = [re.findall(r"\w+", s.lower()) for s in segments]
     return BM25Okapi(tokenized), tokenized
 
-def _query_rewrites(client, q: str, topn: int = 3, lang_code: str = "zh-Hant") -> list[str]:
+def _query_rewrites(client, q: str, topn: int = 3, lang_code: str = "cmn") -> list[str]:
+    # === 修正：擴充字典以支援 cmn/eng/vie (防止 KeyError) ===
     prompt_map = {
+        "cmn": f"請產生{topn}個中文查詢改寫或同義展開，每行一個，簡短，專有名詞保留：\n{q}",
         "zh-Hant": f"請產生{topn}個中文查詢改寫或同義展開，每行一個，簡短，專有名詞保留：\n{q}",
+        
+        "eng": f"Generate {topn} query rewrites or synonym expansions in English, one per line, concise, preserve proper nouns:\n{q}",
         "en": f"Generate {topn} query rewrites or synonym expansions in English, one per line, concise, preserve proper nouns:\n{q}",
+        
+        "vie": f"Hãy tạo {topn} cách viết lại hoặc mở rộng truy vấn bằng tiếng Việt, mỗi dòng một câu, ngắn gọn, giữ nguyên danh từ riêng:\n{q}",
         "vi": f"Hãy tạo {topn} cách viết lại hoặc mở rộng truy vấn bằng tiếng Việt, mỗi dòng một câu, ngắn gọn, giữ nguyên danh từ riêng:\n{q}",
     }
+    # === 修正結束 ===
+    
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt_map[lang_code]}],
-            temperature=0.3, max_tokens=120
-        )
-        lines = [x.strip() for x in (resp.choices[0].message.content or "").splitlines()]
+        # 使用 .get 避免 KeyError
+        prompt_content = prompt_map.get(lang_code, prompt_map["cmn"])
+        messages = [{"role": "user", "content": prompt_content}]
+        content = local_chat_inference(messages, max_new_tokens=150, temperature=0.3)
+        lines = [x.strip() for x in (content or "").splitlines()]
         out = [x for x in lines if x]
         return out[:topn] or [q]
     except Exception:
         return [q]
 
-def hybrid_search(org_key, question, k, embedder, corpora, client, relax=0, lang_code="zh-Hant"):
-    """ relax=0,1,2,3: 0) 純語義 1) 放寬語義 2) 混合排序（BM25+語義） 3) 改寫+混合 """
+def hybrid_search(org_key, question, k, embedder, corpora, client, relax=0, lang_code="cmn"):
     pool = corpora[org_key]
     segs, tags, index, emb = pool["segments"], pool["tags"], pool["index"], pool["emb"]
 
@@ -344,6 +466,7 @@ def hybrid_search(org_key, question, k, embedder, corpora, client, relax=0, lang
         raw_hits = [(int(ix), tags[int(ix)], segs[int(ix)]) for ix in cand_sorted[:max(12, k*3)]]
         return neighbor_answer_augmentation(raw_hits, segs, tags, window_size=3, top_k=k)
 
+    # relax == 3: Multi-query
     rewrites = _query_rewrites(client, question, topn=3, lang_code=lang_code)
     all_hits = []
     for rq in rewrites:
@@ -375,7 +498,7 @@ def build_corpora():
     return embedder, corpora
 
 # =========================
-# Image→Text（遵守選單語言）
+# Image→Text
 # =========================
 def _encode_b64(img: Image.Image, fmt: str, quality: int = 90) -> str:
     buf = BytesIO()
@@ -408,7 +531,7 @@ def _nim_chat(payload: dict) -> str:
     except Exception:
         raise RuntimeError(f"回應格式非預期：{data}")
 
-def nvidia_image_to_text(image_input, lang_code: str = "zh-Hant") -> tuple[str, Image.Image]:
+def nvidia_image_to_text(image_input, lang_code: str = "cmn") -> tuple[str, Image.Image]:
     if isinstance(image_input, Image.Image):
         pil = image_input.copy()
     else:
@@ -434,11 +557,17 @@ def nvidia_image_to_text(image_input, lang_code: str = "zh-Hant") -> tuple[str, 
     if len(b64) > MAX_B64_SIZE:
         raise RuntimeError("影像仍過大，請選較小檔案。")
 
-    ask = {
+    # === 修正：擴充字典以支援 cmn/eng/vie (防止 KeyError) ===
+    ask_map = {
+        "cmn": "用繁體中文描述這張圖片",
         "zh-Hant": "用繁體中文描述這張圖片",
+        "eng": "Describe this image in English.",
         "en": "Describe this image in English.",
+        "vie": "Mô tả bức ảnh này bằng tiếng Việt.",
         "vi": "Mô tả bức ảnh này bằng tiếng Việt.",
-    }[lang_code]
+    }
+    ask = ask_map.get(lang_code, "用繁體中文描述這張圖片")
+    # === 修正結束 ===
 
     payload = {
         "model": NIM_MODEL_MAIN,
@@ -475,7 +604,7 @@ def _save_temp_image(pil_img: Image.Image, suffix: str = ".jpg") -> str:
 # =========================
 def build_corpora_and_clients():
     embedder, corpora = build_corpora()
-    client = get_openai_client()
+    client = get_openai_client() 
     return embedder, corpora, client
 
 def build_app():
@@ -485,11 +614,15 @@ def build_app():
 
     def rag_core(org_label, question, history, lang_code: str):
         org_key = key_by_label[org_label]
+        
+        # 確保 history 是列表
+        history = list(history or [])
 
-        # 1) 小聊（遵守選單語言）
+        # 1) 小聊
         if is_small_talk(client, question):
             ans = generate_small_talk(client, org_key, question, lang_code)
-            history = list(history or []); history.append((question, ans))
+            history.append({"role": "user", "content": question})
+            history.append({"role": "assistant", "content": ans})
             return ans, "", history
 
         # 2) 守門器
@@ -500,46 +633,61 @@ def build_app():
         margin, min_sim = _adaptive_thresholds(question)
         gate_block = ((best - chosen) >= margin) or (best < min_sim)
 
-        # 3) 檢索：基本 → 放寬 → 混合 → 改寫
+        # 3) 檢索
         hits = hybrid_search(org_key, question, FIXED_TOP_K, embedder, corpora, client, relax=0, lang_code=lang_code)
         if not hits:
             for relax in (1, 2, 3):
                 hits = hybrid_search(org_key, question, FIXED_TOP_K, embedder, corpora, client, relax=relax, lang_code=lang_code)
                 if hits: break
 
-        # 4) 有命中 → 生成（遵守選單語言）
+        # 4) 有命中
         if hits:
             retrieved = [h[1] for h in hits]
-            memo = build_memory_summary(history or [])
+            print(">>> RAG 抓到的資料片段：", retrieved)
+            memo = build_memory_summary(history)
             ans = generate_answer(client, ORG_REGISTRY[org_key]["system_prompt"], question, retrieved, memo, lang_code=lang_code)
             refs = "\n\n".join([f"[{i+1}] {h[0]}: {h[1][:600]}" for i, h in enumerate(hits)])
-            history = list(history or []); history.append((question, ans))
+            
+            history.append({"role": "user", "content": question})
+            history.append({"role": "assistant", "content": ans})
             return ans, refs, history
 
         # 5) 無命中
         if gate_block:
-            sorry = {
-                "zh-Hant": "不好意思，目前沒有找到相關資料",
-                "en": "Sorry, I couldn't find relevant materials.",
-                "vi": "Xin lỗi, hiện chưa tìm thấy nội dung liên quan.",
-            }[lang_code]
+            lang_code_map = {
+                 "cmn": "不好意思，目前沒有找到相關資料",
+                 "eng": "Sorry, I couldn't find relevant materials.",
+                 "vie": "Xin lỗi, hiện chưa tìm thấy nội dung liên quan.",
+                 # 加上舊代碼以防萬一
+                 "zh-Hant": "不好意思，目前沒有找到相關資料",
+                 "en": "Sorry, I couldn't find relevant materials.",
+                 "vi": "Xin lỗi, hiện chưa tìm thấy nội dung liên quan.",
+             }
+            sorry = lang_code_map.get(lang_code, "不好意思，目前沒有找到相關資料")
             ans = sorry
-            history = list(history or []); history.append((question, ans))
+            history.append({"role": "user", "content": question})
+            history.append({"role": "assistant", "content": ans})
             return ans, "", history
         else:
+            # 【修正】這裡也需要在 user content 注入語言指令
+            instruction = lang_instruction(lang_code)
             sys_prompt = (
                 ORG_REGISTRY[org_key]["system_prompt"]
                 + "\n\n參考資料未命中。請以通用背景知識給出安全、務實的建議，"
                   "但先提示『以下為通用背景資訊，非出自本機構文件』，字數以 150 字內為宜。"
-                + f"\n\n{lang_instruction(lang_code)}"
+                + f"\n\n{instruction}"
             )
-            resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": question}],
-                temperature=0.3, max_tokens=160,
-            )
-            ans = resp.choices[0].message.content.strip()
-            history = list(history or []); history.append((question, ans))
+            
+            # 強制將指令加入 user message
+            user_msg = f"{question}\n\n({instruction})"
+            
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_msg}
+            ]
+            ans = local_chat_inference(messages, max_new_tokens=200, temperature=0.3)
+            history.append({"role": "user", "content": question})
+            history.append({"role": "assistant", "content": ans})
             return ans, "", history
 
     # --- 文字 ---
@@ -548,69 +696,86 @@ def build_app():
             return history, "請輸入問題。", history
         lang_code = LANG_CODE[lang_label]
         answer, refs, history = rag_core(org_label, user_text.strip(), history, lang_code)
-        chat_history = list(history or [])
-        return chat_history, refs, history
+        return history, refs, history
 
     # --- 語音 ---
     def voice_once(org_label, audio_path, history, lang_label):
         if not audio_path:
             return history, "未偵測到音訊檔案。", history
+        
         try:
-            with open(audio_path, "rb") as af:
-                asr = client.audio.transcriptions.create(model="whisper-1", file=af)
-            user_text = (asr.text or "").strip()
+            # 根據介面語言決定 ASR 語言代碼
+            lang_code_map = {
+                "繁體中文": "cmn_Hant", 
+                "English": "eng_Latn",   
+                "Vietnamese": "vie_Latn" 
+            }
+            asr_lang = lang_code_map.get(lang_label, "cmn_Hant")
+            
+            # 使用 Omnilingual ASR 進行轉錄
+            transcriptions = asr_pipeline.transcribe(
+                [audio_path], 
+                lang=[asr_lang], 
+                batch_size=1
+            )
+            user_text = transcriptions[0].strip()
+            
         except Exception as e:
             user_text = f"(語音轉文字失敗：{e})"
-        if not user_text: user_text = "(未辨識到內容)"
+        
+        if not user_text: 
+            user_text = "(未辨識到內容)"
+        
         return query_once(org_label, user_text, history, lang_label)
 
     # --- 圖片 ---
     def image_once(org_label, image_path, history, lang_label):
+        history = list(history or [])
         if not image_path:
             return history, "", history
         try:
             lang_code = LANG_CODE[lang_label]
             caption, _ = nvidia_image_to_text(image_path, lang_code=lang_code)
-            right_user_msg = ("使用者上傳的圖片", image_path)
-            history = list(history or []); history.append((right_user_msg, caption))
+            # New Gradio Format
+            history.append({"role": "user", "content": f"使用者上傳圖片：\n![]({image_path})"})
+            history.append({"role": "assistant", "content": caption})
             return history, "", history
         except Exception as e:
             lang_code = LANG_CODE[lang_label]
-            err = {
+            # === 修正：擴充字典以支援 cmn/eng/vie ===
+            err_map = {
+                "cmn": "（圖片描述失敗）",
                 "zh-Hant": "（圖片描述失敗）",
+                "eng": "(Image caption failed)",
                 "en": "(Image caption failed)",
+                "vie": "(Mô tả ảnh thất bại)",
                 "vi": "(Mô tả ảnh thất bại)"
-            }[lang_code]
-            right_user_msg = ("使用者上傳的圖片", image_path)
-            history = list(history or []); history.append((right_user_msg, f"{err} {e}"))
+            }
+            err = err_map.get(lang_code, "（圖片描述失敗）")
+            # === 修正結束 ===
+            
+            history.append({"role": "user", "content": f"使用者上傳圖片：\n![]({image_path})"})
+            history.append({"role": "assistant", "content": f"{err} {e}"})
             return history, "", history
 
     # --- UI ---
-    css = """
-    #chatbox { resize: both; overflow: auto; min-height: 360px; }
-    #chatbox img, #chatbox [data-testid="file"] img, #chatbox .file-preview img, #chatbox .message img {
-        max-height: none !important; width: 100% !important; height: auto !important; object-fit: contain !important;
-    }
-    #chatbox .message, #chatbox .wrap, #chatbox .prose { max-width: 100% !important; }
-    """
-
     with gr.Blocks(
-        title="多組織在地 RAG + Whisper + GPT-4 + 影像轉文字（固定輸出語言）",
-        css=css
+        title="AIITNTPU",
     ) as demo:
-        # gr.Markdown("### 🎧 多組織在地 RAG + Whisper + GPT-4 + 影像轉文字（固定輸出語言）")
         with gr.Row():
             org = gr.Dropdown(choices=org_labels, value=org_labels[0], label="選擇組織")
             lang_sel = gr.Dropdown(choices=LANG_LABELS, value="繁體中文", label="回覆語言（固定輸出）")
+        
+        # 修正：移除 type="tuples"，預設就是 messages 格式
         chatbox = gr.Chatbot(label="對話", height=520, elem_id="chatbox")
+        
         state = gr.State([])
-
         with gr.Row():
             question = gr.Textbox(label="輸入你的問題")
-            mic = gr.Microphone(label="語音輸入（講完自動辨識）", type="filepath", format="wav")
-            img = gr.Image(label="上傳圖片（右側顯示原圖，左側生成描述）", type="filepath")
+            mic = gr.Microphone(type="filepath", format="wav")
+            img = gr.Image(type="filepath")
         run = gr.Button("查詢")
-        refs = gr.Textbox(label="參考段落（含來源檔名）", lines=10, visible=False)
+        refs = gr.Textbox(label="參考段落（含來源檔名）", lines=10,visible=False)
 
         # 文字
         run.click(fn=query_once, inputs=[org, question, state, lang_sel], outputs=[chatbox, refs, state])
