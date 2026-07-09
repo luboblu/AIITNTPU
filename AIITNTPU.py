@@ -2,7 +2,9 @@
 # 可以查詢針對某協會的內容
 
 import os
-import openai
+from openai import OpenAI
+
+client = OpenAI(api_key='...')
 import numpy as np
 import faiss
 from flask import Flask, request, abort
@@ -26,7 +28,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # 設定 LINE Bot 與 OpenAI 金鑰
 line_bot_api = LineBotApi('...')
 handler = WebhookHandler('...')
-openai.api_key = '...'
 
 # 初始化 Flask 應用
 app = Flask(__name__)
@@ -156,16 +157,14 @@ def generate_answer(query, retrieved_segments):
     input_text = f"問題: {query}\n上下文: {context}"
     try:
         # 使用新的 OpenAI Chat API 調用方式
-        response = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "你是AIITNTPU計畫的客服助理，需要回答有關中華民國腦性麻痺協會，漸凍人協會，陽光基金會，以及AIITNTPU包容科技計畫的內容，請根據提供的文本回答問題。回答盡量在200字以內"},
-                {"role": "user", "content": input_text}
-            ],
-            temperature=0.7,
-            max_tokens=200
-        )
-        return response.choices[0].message['content']
+        response = client.chat.completions.create(model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "你是AIITNTPU計畫的客服助理，需要回答有關中華民國腦性麻痺協會，漸凍人協會，陽光基金會，以及AIITNTPU包容科技計畫的內容，請根據提供的文本回答問題。回答盡量在200字以內"},
+            {"role": "user", "content": input_text}
+        ],
+        temperature=0.7,
+        max_tokens=200)
+        return response.choices[0].message.content
     except Exception as e:
         return f"生成回應時出錯: {str(e)}"
 
@@ -227,8 +226,8 @@ def handle_audio_message(event):
 
     try:
         with open(audio_path, "rb") as audio_file:
-            response = openai.Audio.transcribe(model="whisper-1", file=audio_file)
-        transcribed_text = response['text']
+            response = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
+        transcribed_text = response.text
     except Exception as e:
         transcribed_text = f"音訊轉錄出錯: {str(e)}"
 

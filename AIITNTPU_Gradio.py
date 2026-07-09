@@ -1,6 +1,8 @@
 import os
 import base64
-import openai
+import json
+from openai import OpenAI
+import subprocess
 from io import BytesIO
 import numpy as np
 import faiss
@@ -15,6 +17,7 @@ from dotenv import load_dotenv
 from PIL import Image
 import requests
 # 禁用不必要警告與平行處理
+client = OpenAI()
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["OMP_NUM_THREADS"] = "1"
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -101,13 +104,11 @@ def generate_answer(query, contexts):
         {"role": "system", "content": "你是AIITNTPU計畫客服助理，請根據上下文回答問題，不超過200字。"},
         {"role": "user", "content": f"問題: {query}\n上下文: {context}"}
     ]
-    resp = openai.ChatCompletion.create(
-        model="gpt-4.1",
-        messages=messages,
-        temperature=0.7,
-        max_tokens=200
-    )
-    return resp.choices[0].message['content']
+    resp = client.chat.completions.create(model="gpt-4.1",
+    messages=messages,
+    temperature=0.7,
+    max_tokens=200)
+    return resp.choices[0].message.content
 
 # Gradio 處理文字
 def chat_text(user_input):
@@ -128,8 +129,8 @@ def chat_audio(audio_file):
             return ""
         # 讀取上傳的檔案
         with open(audio_file, "rb") as af:
-            resp = openai.Audio.transcribe(model="whisper-1", file=af)
-        transcription = resp["text"]
+            resp = client.audio.transcriptions.create(model="whisper-1", file=af)
+        transcription = resp.text
     except Exception as e:
         return f"語音轉錄出錯：{e}"
 
@@ -143,54 +144,42 @@ def encode_img(image: Image.Image, quality: int = 85) -> str:
     image.save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode()
 
-# 呼叫 NVIDIA API 進行圖片描述
-def nvidia_image_to_text(image_path: str):
-    # 檢查是否有檔案
+# Ollama圖片轉文字函數
+def ollama_image_to_text(image_path: str):
+    """使用 Ollama (gemma3:27b-it-qat) 模型將圖片轉為文字描述。"""
     if not image_path:
         return ""
+
     try:
         img = Image.open(image_path).convert("RGB")
+        buf = BytesIO()
+        img.save(buf, format="JPEG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
     except Exception as e:
         return f"無法讀取圖片：{e}"
 
-    b64 = encode_img(img)
-    quality = 85
-    # 壓縮直到小於限制
-    while len(b64) >= MAX_B64_SIZE and quality >= 20:
-        quality -= 15
-        b64 = encode_img(img, quality)
-    if len(b64) >= MAX_B64_SIZE:
-        img = img.resize((img.width // 2, img.height // 2), Image.ANTIALIAS)
-        b64 = encode_img(img, quality)
-    if len(b64) >= MAX_B64_SIZE:
-        raise gr.Error("影像經過壓縮後仍超出大小限制，請使用更小的影像。")
+    # 組裝 prompt
+    prompt = (
+        "請用繁體中文詳細描述以下圖片。\n"
+        f"<img src=\"data:image/jpeg;base64,{b64}\" />"
+    )
 
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": "google/gemma-3-27b-it",
-        "messages": [
-            {"role": "system", "content": "請用繁體中文描述以下圖片。"},
-            {"role": "user", "content": f'<img src="data:image/jpeg;base64,{b64}" />'},
-        ],
-        "max_tokens": 512,
-        "temperature": 0.2,
-        "top_p": 0.7,
-    }
-    response = requests.post(API_URL, headers=headers, json=payload)
     try:
-        response.raise_for_status()
-    except requests.HTTPError:
-        detail = response.json().get("detail", response.text)
-        raise gr.Error(f"API Error {response.status_code}: {detail}")
-    data = response.json()
-    try:
+        # 使用 Ollama CLI 的 run 命令並通過 stdin 傳遞 prompt，指定 gemma3:27b-it-qat 模型
+        result = subprocess.run(
+            ["ollama", "run", "gemma3:27b-it-qat", "--json"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        data = json.loads(result.stdout)
         return data["choices"][0]["message"]["content"].strip()
-    except Exception:
-        raise gr.Error(f"Unexpected response format: {data}")
+    except subprocess.CalledProcessError as e:
+        raise gr.Error(f"Ollama 呼叫失敗：{e.stderr}")
+    except Exception as e:
+        raise gr.Error(f"處理錯誤：{e}")
+
 
 
 # Gradio 介面設置
@@ -203,7 +192,7 @@ with gr.Blocks() as demo:
     out = gr.Textbox(label="回覆")
     txt.submit(chat_text, txt, out)
     mic.change(chat_audio, mic, out)
-    img.change(nvidia_image_to_text, img, out)
+    img.change(ollama_image_to_text, img, out)
     gr.Markdown("---\nAIITNTPU 計畫客服助理")
 
 if __name__ == "__main__":

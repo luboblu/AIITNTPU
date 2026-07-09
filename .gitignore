@@ -176,3 +176,9 @@ cython_debug/
 # Custom
 
 *.pem
+
+# Large model cache / vendored repo / misc (excluded from repo)
+cache/
+fairseq/
+Microsoft/
+.gradio/
