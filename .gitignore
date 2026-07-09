@@ -1,0 +1,15 @@
+# Secrets
+.env
+.env.*
+
+# Local model weights (too large for GitHub)
+*.gguf
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Gradio
+.gradio/
